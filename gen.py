@@ -1,16 +1,20 @@
 """
 ABCK Token Generator - Headless Railway Edition with Flask
+FIXED for Railway deployment
 """
 
 import os, sys, time, random, subprocess, threading, shutil, re, gc, platform, io, warnings, logging
 from datetime import datetime
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
 
 _generation_thread = None
 _generation_running = False
 _generation_stats = {"generated": 0, "total": 0, "status": "idle"}
+_tokens_store = []
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -64,6 +68,7 @@ def install_dependencies():
         "selenium",
         "requests",
         "webdriver-manager",
+        "flask-cors",
     ]
     missing = []
     for dep in dependencies:
@@ -91,6 +96,9 @@ try:
     import requests
 except ImportError:
     install_dependencies()
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from webdriver_manager.chrome import ChromeDriverManager
 
 try:
     import urllib3
@@ -103,22 +111,18 @@ IS_WINDOWS = platform.system() == 'Windows'
 
 TARGET_URL             = "https://mtacc.mobilelegends.com"
 ABCK_FILE              = os.path.join(os.path.dirname(os.path.abspath(__file__)), "abck.txt")
-SERVER_HOST            = "akamai-abck.up.railway.app"
-SERVER_PORT            = "443"
-SERVER_URL             = f"https://{SERVER_HOST}"
-SERVER_SAVE_ENDPOINT   = f"{SERVER_URL}/api/save-token"
-MAX_THREADS            = 3
-NUM_BROWSERS           = 3
-MAX_TOKENS_PER_BROWSER = 15
+MAX_THREADS            = 2  # Reduced for Railway memory limits
+NUM_BROWSERS           = 2  # Reduced for Railway memory limits
+MAX_TOKENS_PER_BROWSER = 10
 MAX_CONSECUTIVE_FAILS  = 5
 SOLVE_TIMEOUT          = 45
 CHECK_INTERVAL         = 0.12
-DELAY_BETWEEN_TOKENS   = (0.3, 0.8)
+DELAY_BETWEEN_TOKENS   = (0.5, 1.0)
 DELAY_BROWSER_RELAUNCH = (1.0, 2.0)
-DEFAULT_TOKEN_COUNT    = 50
-MAX_TOKENS_IN_MEMORY   = 5000
-CLEANUP_INTERVAL       = 100
-SAVE_TO_FILE           = False
+DEFAULT_TOKEN_COUNT    = 30
+MAX_TOKENS_IN_MEMORY   = 500
+CLEANUP_INTERVAL       = 50
+SAVE_TO_FILE           = True
 WIN_W, WIN_H           = 1280, 720
 
 _print_lock = threading.Lock()
@@ -153,6 +157,52 @@ def log_warn(idx, msg):
 def log_relaunch(idx, reason):
     cprint(f"[{ts()}] [B{idx+1}] ↻ RELAUNCH {reason}")
 
+def get_chrome_path():
+    """Find Chrome executable path - FIXED for Railway"""
+    possible_paths = [
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable', 
+        '/usr/bin/chromium-browser',
+        '/usr/bin/chromium',
+        '/opt/google/chrome/chrome',
+        '/snap/bin/chromium'
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            return path
+    
+    # Try to find via which command
+    try:
+        result = subprocess.run(['which', 'google-chrome'], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except:
+        pass
+    
+    return None
+
+def get_chromedriver_path():
+    """Get chromedriver path - FIXED to use webdriver-manager"""
+    try:
+        # Let webdriver-manager handle it
+        driver_path = ChromeDriverManager().install()
+        return driver_path
+    except Exception as e:
+        log_warn(0, f"WebDriver Manager error: {e}")
+        
+        # Fallback paths
+        fallback_paths = [
+            '/usr/bin/chromedriver',
+            '/usr/local/bin/chromedriver',
+            '/snap/bin/chromedriver'
+        ]
+        
+        for path in fallback_paths:
+            if os.path.exists(path):
+                return path
+    return None
+
 def load_existing_tokens():
     if not SAVE_TO_FILE or not os.path.exists(ABCK_FILE):
         return set()
@@ -174,19 +224,13 @@ def save_tokens(tokens):
 def send_tokens_to_server(tokens, use_server=False):
     if not use_server:
         return None
-    try:
-        payload = {"token": tokens}
-        r = requests.post(SERVER_SAVE_ENDPOINT, json=payload, timeout=5, verify=False)
-        if r.status_code in [200, 201]:
-            try:
-                resp = r.json()
-                return resp.get('id') or resp.get('status') or "ok"
-            except Exception:
-                return "ok"
-        else:
-            return None
-    except:
-        return None
+    # Store locally instead of external server
+    global _tokens_store
+    _tokens_store.append({
+        "token": tokens,
+        "timestamp": datetime.now().isoformat()
+    })
+    return "local_storage"
 
 _ram_tokens_count = 0
 _ram_tokens_count_lock = threading.Lock()
@@ -208,47 +252,18 @@ def get_chrome_version():
     if _chrome_version_cache is not None:
         return _chrome_version_cache
 
-    if IS_LINUX:
-        for cmd in ['google-chrome --version', 'google-chrome-stable --version',
-                     'chromium-browser --version', 'chromium --version']:
-            try:
-                result = subprocess.run(
-                    cmd.split(), capture_output=True, text=True, timeout=5
-                )
-                if result.returncode == 0:
-                    match = re.search(r'(\d+)\.', result.stdout)
-                    if match:
-                        _chrome_version_cache = int(match.group(1))
-                        return _chrome_version_cache
-            except Exception:
-                pass
-    else:
+    chrome_path = get_chrome_path()
+    if chrome_path:
         try:
-            result = subprocess.run(
-                ['reg', 'query', r'HKEY_CURRENT_USER\Software\Google\Chrome\BLBeacon', '/v', 'version'],
-                capture_output=True, text=True, timeout=5
-            )
+            result = subprocess.run([chrome_path, '--version'], capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
-                for line in result.stdout.split('\n'):
-                    if 'version' in line.lower():
-                        _chrome_version_cache = int(line.strip().split()[-1].split('.')[0])
-                        return _chrome_version_cache
+                match = re.search(r'(\d+)\.', result.stdout)
+                if match:
+                    _chrome_version_cache = int(match.group(1))
+                    return _chrome_version_cache
         except Exception:
             pass
-        try:
-            for base in [
-                os.path.join(os.environ.get('PROGRAMFILES', ''), 'Google', 'Chrome', 'Application'),
-                os.path.join(os.environ.get('PROGRAMFILES(X86)', ''), 'Google', 'Chrome', 'Application'),
-                os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Google', 'Chrome', 'Application'),
-            ]:
-                if os.path.isdir(base):
-                    for name in os.listdir(base):
-                        if name[0].isdigit() and '.' in name:
-                            _chrome_version_cache = int(name.split('.')[0])
-                            return _chrome_version_cache
-        except Exception:
-            pass
-    return None
+    return 120  # Default fallback version
 
 def cleanup_chrome_garbage():
     base = _get_temp_base()
@@ -306,154 +321,92 @@ def create_driver(chrome_ver=None, browser_index=0):
     for attempt in range(3):
         try:
             options = Options()
-            for arg in [
-                "--no-first-run",
-                "--no-service-autorun",
-                "--no-default-browser-check",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-popup-blocking",
-                "--disable-infobars",
-                "--disable-gpu",
-                "--disable-default-apps",
-                "--no-sandbox",
-                "--single-process",
-                "--disable-logging",
-                "--disable-crash-reporter",
-                "--disable-component-update",
-                "--disable-sync",
-                "--disable-translate",
-                "--log-level=3",
-                "--disable-domain-reliability",
-                "--disable-client-side-phishing-detection",
-                "--safebrowsing-disable-auto-update",
-                "--headless=new",
-                f"--window-size={WIN_W},{WIN_H}",
-            ]:
-                options.add_argument(arg)
-
-            fp = generate_mobile_fingerprint()
-            options.add_argument(f"--user-agent={fp['user_agent']}")
-
-            prefs = {}
-            options.add_experimental_option("prefs", prefs)
+            
+            # Essential headless options for Railway
+            options.add_argument("--headless=new")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--disable-popup-blocking")
+            options.add_argument("--disable-infobars")
+            options.add_argument("--disable-default-apps")
+            options.add_argument("--single-process")
+            options.add_argument("--disable-logging")
+            options.add_argument("--disable-crash-reporter")
+            options.add_argument("--disable-component-update")
+            options.add_argument("--disable-sync")
+            options.add_argument("--disable-translate")
+            options.add_argument("--log-level=3")
+            options.add_argument("--disable-domain-reliability")
+            options.add_argument("--disable-client-side-phishing-detection")
+            options.add_argument("--safebrowsing-disable-auto-update")
+            options.add_argument(f"--window-size={WIN_W},{WIN_H}")
+            
+            # Memory optimization for Railway
+            options.add_argument("--memory-pressure-off")
+            options.add_argument("--max_old_space_size=256")
+            
+            # Set user agent
+            user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            options.add_argument(f"--user-agent={user_agent}")
+            
+            # Remove automation flags
             options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
             options.add_experimental_option("useAutomationExtension", False)
-
-            temp_dir = os.path.join(_get_temp_base(), f'uc_b{browser_index}')
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            os.makedirs(temp_dir, exist_ok=True)
-            options.add_argument(f"--user-data-dir={temp_dir}")
-
-            binary = None
+            
+            # Set binary location
+            chrome_path = get_chrome_path()
+            if chrome_path:
+                options.binary_location = chrome_path
+                log_info(browser_index, f"Using Chrome: {chrome_path}")
+            
+            # Get chromedriver
+            chromedriver_path = get_chromedriver_path()
+            if not chromedriver_path:
+                log_warn(browser_index, "ChromeDriver not found!")
+                return None
+            
+            # Create driver
+            service = webdriver.chrome.service.Service(chromedriver_path)
+            driver = webdriver.Chrome(service=service, options=options)
+            
+            driver.set_page_load_timeout(30)
+            driver.set_script_timeout(30)
+            
+            # Remove webdriver property
             try:
-                bins = os.environ.get('CHROME_BINARIES')
-                if bins:
-                    parts = [p.strip() for p in bins.split(',') if p.strip()]
-                    if parts:
-                        binary = parts[browser_index % len(parts)]
-                if not binary:
-                    binary = os.environ.get('CHROME_BINARY')
-                
-                if not binary:
-                    if IS_WINDOWS:
-                        windows_paths = [
-                            os.path.join(os.environ.get('PROGRAMFILES', 'C:\\Program Files'), 'Google', 'Chrome', 'Application', 'chrome.exe'),
-                            os.path.join(os.environ.get('PROGRAMFILES(X86)', 'C:\\Program Files (x86)'), 'Google', 'Chrome', 'Application', 'chrome.exe'),
-                            os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Google', 'Chrome', 'Application', 'chrome.exe'),
-                            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-                            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-                        ]
-                        for chrome_exe in windows_paths:
-                            if chrome_exe and os.path.isfile(chrome_exe):
-                                binary = chrome_exe
-                                break
-                    else:
-                        for path in ['/usr/bin/google-chrome-stable', '/usr/bin/google-chrome',
-                                     '/usr/bin/chromium-browser', '/usr/bin/chromium',
-                                     '/snap/bin/chromium']:
-                            if os.path.isfile(path):
-                                binary = path
-                                break
-                
-                if binary and os.path.isfile(binary):
-                    options.binary_location = binary
-            except Exception as e:
-                log_warn(browser_index, f"Binary detection error: {str(e)[:50]}")
-
-            driver = webdriver.Chrome(options=options, service=webdriver.chrome.service.Service('/usr/bin/chromedriver'))
-            driver.set_page_load_timeout(12)
-            driver.set_script_timeout(3)
-            try:
-                driver.set_window_size(WIN_W, WIN_H)
                 driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
                 driver.execute_script("Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]})")
                 driver.execute_script("Object.defineProperty(navigator, 'languages', {get: () => ['en-US']})")
-                inject_fingerprint(driver, {
-                    "platform": fp["platform"],
-                    "hardware_concurrency": fp["hardware_concurrency"],
-                    "device_memory": fp["device_memory"],
-                    "dpr": random.choice([3, 3.5]),
-                    "webgl_vendor": fp["webgl_vendor"],
-                    "webgl_renderer": fp["webgl_renderer"],
-                })
             except Exception:
                 pass
+            
             return driver
+            
         except Exception as e:
-            import traceback
             err_msg = str(e)
             log_warn(browser_index, f"Launch failed ({attempt+1}/3): {err_msg[:150]}")
-            if attempt == 2:
-                log_warn(browser_index, f"Full error: {err_msg}")
-                log_warn(browser_index, f"Traceback: {traceback.format_exc()[:200]}")
-            time.sleep(0.5)
+            time.sleep(1)
+    
     return None
 
 def generate_mobile_fingerprint() -> dict:
-    res = random.choice([
-        {"w": 1080, "h": 2400, "dpr": 3},
-        {"w": 1080, "h": 2340, "dpr": 3},
-        {"w": 1440, "h": 3120, "dpr": 3.5},
-    ])
     return {
-        "screen":      f"{res['w']}x{res['h']}x24",
-        "user_agent":  "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        "language":    "en-US,en;q=0.9",
-        "webgl_vendor": "Google Inc. (ARM)",
-        "webgl_renderer": random.choice([
-            "ANGLE (ARM, Mali-G710 MC10, OpenGL ES 3.2)",
-            "ANGLE (Qualcomm, Adreno (TM) 730, OpenGL ES 3.2)",
-        ]),
-        "hardware_concurrency": random.choice([8, 12]),
-        "device_memory": 8,
-        "platform":    "Android",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "platform": "Windows",
+        "hardware_concurrency": 4,
+        "device_memory": 4,
+        "webgl_vendor": "Google Inc.",
+        "webgl_renderer": "ANGLE (Intel, Intel UHD Graphics)",
     }
 
 def inject_fingerprint(driver, fingerprint_data):
     try:
-        nav = {
-            "platform": fingerprint_data.get("platform", "Android"),
-            "hardwareConcurrency": fingerprint_data.get("hardware_concurrency", 8),
-            "deviceMemory": fingerprint_data.get("device_memory", 8),
-            "maxTouchPoints": 5,
-        }
-
         script = f"""
-        Object.defineProperty(navigator, 'platform', {{ get: () => '{nav['platform']}' }});
-        Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {nav['hardwareConcurrency']} }});
-        Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {nav['deviceMemory']} }});
-        Object.defineProperty(navigator, 'maxTouchPoints', {{ get: () => {nav['maxTouchPoints']} }});
-
-        Object.defineProperty(window, 'devicePixelRatio', {{ get: () => {fingerprint_data.get('dpr', 3)} }});
-
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(parameter) {{
-            if (parameter === 37445) return '{fingerprint_data.get('webgl_vendor', 'Google Inc. (ARM)')}';
-            if (parameter === 37446) return '{fingerprint_data.get('webgl_renderer', 'ANGLE (ARM, Mali-G710 MC10, OpenGL ES 3.2)')}';
-            return getParameter.call(this, parameter);
-        }};
+        Object.defineProperty(navigator, 'platform', {{ get: () => '{fingerprint_data.get("platform", "Windows")}' }});
+        Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {fingerprint_data.get("hardware_concurrency", 4)} }});
+        Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {fingerprint_data.get("device_memory", 4)} }});
         """
         driver.execute_script(script)
     except Exception:
@@ -465,97 +418,7 @@ def safe_quit(driver, browser_index=None):
             driver.quit()
         except Exception:
             pass
-        if browser_index is not None:
-            temp_dir = os.path.join(_get_temp_base(), f'uc_b{browser_index}')
-            shutil.rmtree(temp_dir, ignore_errors=True)
         cleanup_chrome_garbage()
-
-def _bezier_points(x1, y1, x2, y2, steps=12):
-    cx1 = x1 + random.randint(-80, 80)
-    cy1 = y1 + random.randint(-60, 60)
-    cx2 = x2 + random.randint(-80, 80)
-    cy2 = y2 + random.randint(-60, 60)
-    points = []
-    for i in range(steps + 1):
-        t = i / steps
-        u = 1 - t
-        px = int(u**3*x1 + 3*u**2*t*cx1 + 3*u*t**2*cx2 + t**3*x2)
-        py = int(u**3*y1 + 3*u**2*t*cy1 + 3*u*t**2*cy2 + t**3*y2)
-        px = max(5, min(px, WIN_W - 5))
-        py = max(5, min(py, WIN_H - 5))
-        points.append((px, py))
-    return points
-
-def cdp_mouse_move(driver):
-    try:
-        x1, y1 = random.randint(100, WIN_W-200), random.randint(80, WIN_H-200)
-        x2, y2 = random.randint(100, WIN_W-100), random.randint(80, WIN_H-100)
-        points = _bezier_points(x1, y1, x2, y2, steps=random.randint(8, 18))
-        for px, py in points:
-            driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                'type': 'mouseMoved', 'x': px, 'y': py
-            })
-            time.sleep(random.uniform(0.005, 0.025))
-        if random.random() < 0.3:
-            cx, cy = points[-1]
-            for etype in ['mousePressed', 'mouseReleased']:
-                driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                    'type': etype, 'x': cx, 'y': cy,
-                    'button': 'left', 'clickCount': 1
-                })
-                time.sleep(random.uniform(0.03, 0.08))
-    except Exception:
-        pass
-
-def cdp_scroll(driver):
-    try:
-        x, y = random.randint(200, WIN_W-200), random.randint(200, WIN_H-200)
-        delta_y = random.choice([-120, -80, 80, 120, 200, -200])
-        driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-            'type': 'mouseWheel', 'x': x, 'y': y,
-            'deltaX': 0, 'deltaY': delta_y
-        })
-    except Exception:
-        pass
-
-def cdp_keyboard(driver):
-    try:
-        driver.execute_script("""
-            document.dispatchEvent(new Event('mouseover'));
-            document.dispatchEvent(new Event('focus'));
-            var el = document.elementFromPoint(
-                Math.random() * window.innerWidth,
-                Math.random() * window.innerHeight
-            );
-            if (el) { el.dispatchEvent(new MouseEvent('mouseover', {bubbles: true})); }
-        """)
-    except Exception:
-        pass
-
-def inject_sensor_triggers(driver):
-    try:
-        driver.execute_script("""
-            ['pointerdown','pointerup','pointerover','pointermove'].forEach(function(evt){
-                document.dispatchEvent(new PointerEvent(evt, {
-                    pointerId: 1, bubbles: true, clientX: Math.random()*800+100, clientY: Math.random()*400+100
-                }));
-            });
-            ['mousedown','mouseup','mousemove','mouseover'].forEach(function(evt){
-                document.dispatchEvent(new MouseEvent(evt, {
-                    bubbles: true, clientX: Math.random()*900+50, clientY: Math.random()*500+50
-                }));
-            });
-            ['keydown','keyup'].forEach(function(evt){
-                document.dispatchEvent(new KeyboardEvent(evt, {
-                    key: 'a', code: 'KeyA', keyCode: 65, bubbles: true
-                }));
-            });
-            window.dispatchEvent(new Event('scroll'));
-            document.dispatchEvent(new Event('visibilitychange'));
-            window.dispatchEvent(new Event('focus'));
-        """)
-    except Exception:
-        pass
 
 def get_solved_abck(cookies):
     for c in cookies:
@@ -564,51 +427,32 @@ def get_solved_abck(cookies):
     return None
 
 def wait_for_solve(driver, timeout=SOLVE_TIMEOUT, browser_index=0):
-    start    = time.time()
-    dots     = 0
+    start = time.time()
     last_log = -10
 
     try:
-        time.sleep(random.uniform(1.0, 2.0))
-        inject_sensor_triggers(driver)
-        time.sleep(random.uniform(0.5, 1.0))
-        cdp_mouse_move(driver)
-    except Exception:
+        driver.get(TARGET_URL)
+        time.sleep(3)
+    except Exception as e:
+        log_warn(browser_index, f"Page load error: {e}")
         return None
 
     while time.time() - start < timeout:
         try:
-            _ = driver.current_url
             cookies = driver.get_cookies()
-        except Exception:
-            return None
-        solved = get_solved_abck(cookies)
-        if solved:
-            return solved
-
-        action = dots % 5
-        try:
-            if action == 0:
-                cdp_mouse_move(driver)
-            elif action == 1:
-                cdp_scroll(driver)
-            elif action == 2:
-                cdp_keyboard(driver)
-            elif action == 3:
-                cdp_mouse_move(driver)
-                inject_sensor_triggers(driver)
+            solved = get_solved_abck(cookies)
+            if solved:
+                return solved
         except Exception:
             pass
 
-        dots   += 1
         elapsed = int(time.time() - start)
         if elapsed - last_log >= 8:
-            try:
-                log_solving(browser_index, elapsed)
-            except Exception:
-                pass
+            log_solving(browser_index, elapsed)
             last_log = elapsed
+        
         time.sleep(CHECK_INTERVAL)
+    
     return None
 
 class SharedState:
@@ -669,9 +513,7 @@ def browser_worker(idx, shared, use_server, chrome_ver):
 
             if need_new:
                 if driver is not None:
-                    reason = (f"{consec_fails}×"
-                              if consec_fails >= MAX_CONSECUTIVE_FAILS
-                              else f"{tok_this_br} tokens")
+                    reason = (f"{consec_fails}×" if consec_fails >= MAX_CONSECUTIVE_FAILS else f"{tok_this_br} tokens")
                     log_relaunch(idx, reason)
                     safe_quit(driver, idx)
                     driver = None
@@ -686,47 +528,12 @@ def browser_worker(idx, shared, use_server, chrome_ver):
 
                 consec_fails = 0
                 tok_this_br  = 0
-                page_load_ok = False
-                try:
-                    log_info(idx, "loading")
-                    driver.get(TARGET_URL)
-                    log_info(idx, "page loaded")
-                    time.sleep(random.uniform(2.0, 3.5))
-                    cdp_mouse_move(driver)
-                    time.sleep(random.uniform(0.3, 0.6))
-                    inject_sensor_triggers(driver)
-                    page_load_ok = True
-                except Exception as e:
-                    log_warn(idx, f"Page load error: {str(e)[:60]}")
-                    safe_quit(driver, idx)
-                    driver = None
-                    continue
-                
-                if not page_load_ok:
-                    continue
-            else:
-                try:
-                    driver.delete_cookie('_abck')
-                    if random.random() < 0.3:
-                        driver.refresh()
-                    else:
-                        driver.get(TARGET_URL)
-                    time.sleep(random.uniform(1.5, 2.5))
-                    cdp_mouse_move(driver)
-                    inject_sensor_triggers(driver)
-                except Exception:
-                    safe_quit(driver, idx)
-                    driver = None
-                    continue
 
             with shared.lock:
                 gen_now = shared.generated
-            remaining  = "∞" if shared.loop_forever else str(shared.target_count - gen_now)
+            remaining = "∞" if shared.loop_forever else str(shared.target_count - gen_now)
             file_count = count_tokens()
-            try:
-                log_status(idx, attempt, gen_now, file_count, remaining, tok_this_br)
-            except Exception:
-                pass
+            log_status(idx, attempt, gen_now, file_count, remaining, tok_this_br)
 
             token = wait_for_solve(driver, timeout=SOLVE_TIMEOUT, browser_index=idx)
 
@@ -734,27 +541,23 @@ def browser_worker(idx, shared, use_server, chrome_ver):
                 if shared.add_tokens(token):
                     save_tokens(token)
                     increment_tokens_count()
-                    server_id  = send_tokens_to_server(token, use_server)
-                    tok_this_br  += 1
-                    consec_fails  = 0
+                    server_id = send_tokens_to_server(token, use_server)
+                    tok_this_br += 1
+                    consec_fails = 0
                     with shared.lock:
                         g = shared.generated
                     extra = f"  [srv:{server_id}]" if use_server and server_id else ""
-                    try:
-                        log_success(idx, g, token, extra)
-                    except Exception:
-                        pass
+                    log_success(idx, g, token, extra)
                     time.sleep(random.uniform(*DELAY_BETWEEN_TOKENS))
                 else:
                     log_warn(idx, "Duplicate token, skip")
-                    try: driver.delete_all_cookies()
-                    except Exception: pass
+                    try: 
+                        driver.delete_all_cookies()
+                    except Exception: 
+                        pass
             else:
                 consec_fails += 1
-                try:
-                    log_fail(idx, consec_fails, MAX_CONSECUTIVE_FAILS)
-                except Exception:
-                    pass
+                log_fail(idx, consec_fails, MAX_CONSECUTIVE_FAILS)
                 try:
                     driver.delete_all_cookies()
                 except Exception:
@@ -771,7 +574,7 @@ def browser_worker(idx, shared, use_server, chrome_ver):
         log_info(idx, "Worker finished.")
 
 def generate(target_count, loop_forever=False, use_server=False):
-    shared  = SharedState(target_count, loop_forever)
+    shared = SharedState(target_count, loop_forever)
     threads = []
 
     chrome_ver = get_chrome_version()
@@ -784,7 +587,7 @@ def generate(target_count, loop_forever=False, use_server=False):
         threads.append(t)
         t.start()
         if i < NUM_BROWSERS - 1:
-            time.sleep(1.5)
+            time.sleep(2)
 
     try:
         while any(t.is_alive() for t in threads):
@@ -808,7 +611,7 @@ def _generation_worker(threads, loop_forever, use_server):
     try:
         _generation_stats["status"] = "running"
         start = time.time()
-        generated = generate(50, loop_forever, use_server)
+        generated = generate(DEFAULT_TOKEN_COUNT, loop_forever, use_server)
         elapsed = time.time() - start
         total = count_tokens()
         
@@ -828,13 +631,24 @@ def _generation_worker(threads, loop_forever, use_server):
         cleanup_chrome_garbage()
 
 @app.route('/', methods=['GET'])
+def index():
+    return jsonify({
+        "service": "ABCK Token Generator",
+        "status": _generation_stats["status"],
+        "generated": _generation_stats["generated"],
+        "total": _generation_stats["total"],
+        "endpoints": ["/status", "/start", "/stop", "/health", "/tokens"]
+    })
+
+@app.route('/status', methods=['GET'])
 def status():
     return jsonify({
         "status": _generation_stats["status"],
         "generated": _generation_stats["generated"],
         "total": _generation_stats["total"],
         "elapsed": _generation_stats.get("elapsed", 0),
-        "error": _generation_stats.get("error")
+        "error": _generation_stats.get("error"),
+        "is_running": _generation_running
     })
 
 @app.route('/start', methods=['POST'])
@@ -846,7 +660,7 @@ def start_generation():
     
     data = request.json or {}
     threads = min(data.get("threads", 1), MAX_THREADS)
-    use_server = data.get("use_server", True)
+    use_server = data.get("use_server", False)  # Default to False for Railway
     
     NUM_BROWSERS = threads
     _generation_stats["status"] = "starting"
@@ -878,11 +692,32 @@ def stop_generation():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True,
+        "chrome_available": get_chrome_path() is not None,
+        "chromedriver_available": get_chromedriver_path() is not None
+    })
+
+@app.route('/tokens', methods=['GET'])
+def get_tokens():
+    limit = request.args.get('limit', 50, type=int)
+    try:
+        with open(ABCK_FILE, 'r') as f:
+            all_tokens = f.readlines()
+        recent_tokens = all_tokens[-limit:]
+        return jsonify({
+            "total": len(all_tokens),
+            "tokens": [t.strip() for t in recent_tokens]
+        })
+    except:
+        return jsonify({"total": 0, "tokens": []})
 
 def main():
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    cprint(f"[{ts()}] Starting ABCK Token Generator on port {port}")
+    cprint(f"[{ts()}] Chrome available: {get_chrome_path() is not None}")
+    cprint(f"[{ts()}] ChromeDriver available: {get_chromedriver_path() is not None}")
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
 
 if __name__ == "__main__":
     main()
